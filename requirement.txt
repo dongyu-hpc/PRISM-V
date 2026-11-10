@@ -1,0 +1,41 @@
+# Dependency for CUT3R / reconstruction
+numpy
+
+roma
+gradio
+matplotlib
+tqdm
+opencv-python
+scipy
+einops
+trimesh
+tensorboard
+pyglet
+huggingface-hub[torch]
+
+lpips
+hydra-core
+pillow
+h5py
+accelerate
+transformers
+scikit-learn
+
+# for the PRISM-V agent API
+open3d
+openai
+google-genai
+backoff
+pydantic
+
+# PRISM-V additions
+# -----------------------------------------------------------------------
+# The verification layer (prismv.geover), the metrics (prismv.eval.metrics) and
+# the analysis sweeps (prismv.analysis) are pure numpy -- they are already
+# covered above and install with no GPU, no weights and no API key.
+#
+# Optional:
+#   pytest        offline test suite: python -m pytest tests/ -q
+#   segment-anything / SAM2  2D entity masks for mask->3D grounding
+#                            (checkpoint path in configs/main.yaml); without masks
+#                            GeoVer reports abstention instead of guessing entities
