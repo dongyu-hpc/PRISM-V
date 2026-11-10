@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -146,7 +145,6 @@ def lift_masks(entity_masks: Sequence[Dict], pointmap: np.ndarray,
                     mask = mask.astype(bool)
                 if mask.shape != (H, W):
                     # tolerate full-resolution masks by nearest-neighbour resampling
-                    from numpy import indices
                     rr = (np.linspace(0, mask.shape[0] - 1, H)).astype(int)
                     cc = (np.linspace(0, mask.shape[1] - 1, W)).astype(int)
                     mask = mask[rr][:, cc].astype(bool)
@@ -169,7 +167,8 @@ def lift_masks(entity_masks: Sequence[Dict], pointmap: np.ndarray,
             if len(sel) == 0:
                 continue
             if len(sel) > max_pixels_per_entity:
-                idx = np.random.RandomState(0).choice(len(sel), max_pixels_per_entity, replace=False)
+                idx = np.random.RandomState(0).choice(len(sel), max_pixels_per_entity,
+                                                      replace=False)
                 sel = sel[np.sort(idx)]
             chunks.append(sel)
             views_used.append(v)
@@ -299,8 +298,10 @@ def build_scene_graph(processed_dir: Optional[str] = None,
         extrinsics, intrinsics = load_camera_spec(processed_dir)
     if point_cloud is None and reconstruction is not None:
         point_cloud = getattr(reconstruction, "point_cloud", None)
-        extrinsics = getattr(reconstruction, "extrinsics", None) if extrinsics is None else extrinsics
-        intrinsics = getattr(reconstruction, "intrinsics", None) if intrinsics is None else intrinsics
+        if extrinsics is None:
+            extrinsics = getattr(reconstruction, "extrinsics", None)
+        if intrinsics is None:
+            intrinsics = getattr(reconstruction, "intrinsics", None)
         if pm is None:
             pd = getattr(reconstruction, "_processed_dir", None)
             if pd:
@@ -327,7 +328,8 @@ def build_scene_graph(processed_dir: Optional[str] = None,
         if entities:
             diag["grounding_path"] = "mask_lift"
     if not entities and entity_masks and pm is None:
-        # masks without a pointmap cannot be lifted; say so instead of silently clustering
+        # masks with no pointmap cannot be lifted; record that instead of silently
+        # substituting a weaker grounding path
         diag["grounding_path"] = "masks_without_pointmap"
     if not entities and fallback_clusters and point_cloud is not None:
         entities = cluster_entities(point_cloud, extrinsics, k=fallback_clusters)

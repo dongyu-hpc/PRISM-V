@@ -45,7 +45,6 @@ def tool_strategy_analysis(cells: Iterable[Dict]) -> Dict:
     freq_wrong: Counter = Counter()
     first_tool: Counter = Counter()
     transitions: Counter = Counter()
-    failures: Counter = Counter()
     no_tool_correct = no_tool_total = 0
     for r in rows:
         ts = r["tool_summary"]
@@ -66,16 +65,14 @@ def tool_strategy_analysis(cells: Iterable[Dict]) -> Dict:
             first_tool[seq[0]] += 1
             for a, b in zip(seq, seq[1:]):
                 transitions[f"{a}->{b}"] += 1
-        for c in ts.get("sequence", []):
-            pass
-        for note in []:
-            failures[note] += 1
     return {
         "n_programs": len(rows),
         "mean_calls": round(float(np.mean([len(r["tool_summary"].get("sequence", []))
                                            for r in rows])), 3),
-        "mean_calls_correct": round(float(np.mean(seq_len_correct)), 3) if seq_len_correct else None,
-        "mean_calls_wrong": round(float(np.mean(seq_len_wrong)), 3) if seq_len_wrong else None,
+        "mean_calls_correct": (round(float(np.mean(seq_len_correct)), 3)
+                               if seq_len_correct else None),
+        "mean_calls_wrong": (round(float(np.mean(seq_len_wrong)), 3)
+                             if seq_len_wrong else None),
         "tool_frequency": dict(freq.most_common()),
         "tool_frequency_correct": dict(freq_correct.most_common()),
         "tool_frequency_wrong": dict(freq_wrong.most_common()),
@@ -201,6 +198,14 @@ def reconstruction_sweep(run_once, conf_values: Sequence[float] = (0.0, 1.0, 2.5
             if kind == "conf_thres":
                 row["grounding"] = reconstruction_quality_metrics(
                     [r.get("_graph") for r in res])
+            # A knob that changes nothing still yields a perfectly smooth curve, and that
+            # curve will be plotted. The depth-confidence threshold, for example, only bites
+            # on the mask-lifting path -- entities injected as 3D points carry no per-point
+            # confidence, so sweeping it there is a no-op. Flag identical arms explicitly so
+            # an inert ablation is visible in the table instead of masquerading as a result.
+            state = (row.get("grounding", {}).get("mean_points_per_entity"),
+                     row["n"], row["accuracy"])
+            row["_state"] = repr(state)
             out.append(row)
             if verbose:
                 print(f"  {kind}={v!s:<6} acc={row['accuracy']:.4f} "
@@ -211,6 +216,22 @@ def reconstruction_sweep(run_once, conf_values: Sequence[float] = (0.0, 1.0, 2.5
         by_knob[row["knob"]].append(row)
     trends = {}
     for knob, rows in by_knob.items():
+        states = {r.pop("_state") for r in rows}
+        inert = len(states) < len(rows)
+        for r in rows:
+            r["knob_effective"] = not inert
+        if inert:
+            cause = {
+                "conf_thres": "the depth-confidence filter is applied only when lifting 2D "
+                              "masks through a pointmap; entities supplied as ready 3D points "
+                              "carry no per-point confidence and are unaffected",
+                "n_views": "the caller's run_once ignored the n_views argument, or every "
+                           "scene already has <= the smallest requested view count",
+            }.get(knob, "the knob is not consumed on the current path")
+            print(f"[PRISM-V] WARNING knob '{knob}' produced identical states across "
+                  f"{len(rows)} arms, so this ablation measured nothing. Likely cause: "
+                  f"{cause}. Do not plot it as a quality curve.")
+    for knob, rows in by_knob.items():
         nets = [(r["value"], r["effect"].get("net", 0)) for r in rows]
         if len(nets) >= 2:
             xs = np.array([float(v) for v, _ in nets])
@@ -218,8 +239,12 @@ def reconstruction_sweep(run_once, conf_values: Sequence[float] = (0.0, 1.0, 2.5
             if xs.std() > 0:
                 trends[knob] = {"net_effect_by_value": nets,
                                "slope": round(float(np.polyfit(xs, ys, 1)[0]), 5)}
-    return [{"sweep": o, "trend": trends.get(o["knob"], {})} if o is out[-1] else o
-            for o in out]
+    # Uniform row shape: every arm is a flat dict. Wrapping the last row into a different
+    # shape (an earlier revision did) makes any table-building consumer crash on exactly one
+    # row, which is the worst possible place for a schema surprise to surface.
+    for row in out:
+        row["trend"] = trends.get(row["knob"], {})
+    return out
 
 
 # --------------------------------------------------------------------- verification mechanism
@@ -275,6 +300,34 @@ def verification_mechanism_analysis(results: Iterable[Dict]) -> Dict:
         "applied_rate": round(applied / len(rows), 4),
         "answer_changed_rate": round(changed / len(rows), 4),
         "by_relation": relation_table,
+        # cost of the verification layer itself: claim 2 calls GeoVer "lightweight", and the
+        # only honest way to say that is to price it per question.
+        "cost": verification_cost(results),
+    }
+
+
+def verification_cost(results: Iterable[Dict]) -> Dict:
+    """GeoVer 自身的开销：谓词求值的次数与微秒级耗时分布。
+
+    只统计谓词求值本身（不含接地与重建），因为"轻量验证层"指的是这一层；把 VGGT 的时间
+    混进来就不是验证成本而是感知成本，两个数需要分开报。
+    """
+    costs = [c.get("cost_us") for r in results
+             for c in (r.get("verification") or {}).get("checks", [])]
+    costs = [float(c) for c in costs if isinstance(c, (int, float))]
+    per_q = []
+    for r in results:
+        cs = [c.get("cost_us") for c in (r.get("verification") or {}).get("checks", [])]
+        cs = [float(c) for c in cs if isinstance(c, (int, float))]
+        if cs:
+            per_q.append(sum(cs))
+    return {
+        "n_predicate_evals": len(costs),
+        "mean_per_check_us": round(float(np.mean(costs)), 1) if costs else None,
+        "p95_per_check_us": round(float(np.percentile(costs, 95)), 1) if costs else None,
+        "mean_per_question_us": round(float(np.mean(per_q)), 1) if per_q else None,
+        "p95_per_question_us": round(float(np.percentile(per_q, 95)), 1) if per_q else None,
+        "max_per_question_us": round(float(np.max(per_q)), 1) if per_q else None,
     }
 
 

@@ -315,9 +315,29 @@ def test_verification_is_deterministic():
     gv = GeoVer(graph=build_graph())
     q = "From the viewpoint presented in image 1, what is to the right of the book?"
     opts = {"A": "cup", "B": "plant", "C": "sofa", "D": "lamp"}
-    r1 = gv.verify_and_rerank(q, opts, vlm_answer="B").to_dict()
-    r2 = gv.verify_and_rerank(q, opts, vlm_answer="B").to_dict()
+    def strip_instrument(d):
+        """Timing is instrumentation; the geometric verdict must be reproducible.
+
+        Cost is deliberately recorded (claim 2 calls GeoVer "lightweight", which is only
+        defensible with a measured number) but it must not be allowed to weaken the much
+        stronger guarantee that the same scene yields the same verdict every time.
+        """
+        from prismv.geover.verifier import INSTRUMENT_KEYS
+
+        def cut(x):
+            if isinstance(x, dict):
+                return {k: cut(v) for k, v in x.items() if k not in INSTRUMENT_KEYS}
+            if isinstance(x, list):
+                return [cut(v) for v in x]
+            return x
+        return cut(d)
+
+    r1 = strip_instrument(gv.verify_and_rerank(q, opts, vlm_answer="B").to_dict())
+    r2 = strip_instrument(gv.verify_and_rerank(q, opts, vlm_answer="B").to_dict())
     assert r1 == r2, "identical inputs must produce identical audit trails"
+    # ...and the instrument keys really were present, or the strip would hide a regression
+    raw = gv.verify_and_rerank(q, opts, vlm_answer="B").to_dict()
+    assert any("cost_us" in c for c in raw["verification"]["checks"]), raw["verification"]["counts"]
     # every check must name the evidence that decided it
     assert r1["verification"]["counts"]["supported"] > 0
     for chk in r1["verification"]["checks"]:

@@ -14,11 +14,12 @@ without touching perception, and ablate grounding without touching the reranker.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, Optional, Sequence
 
 import numpy as np
 
-from prismv.geover.evidence import EntityEvidence, EvidenceBundle, GeometricEvidenceIndex, SceneGraph
+from prismv.geover.evidence import (EntityEvidence, EvidenceBundle,
+                                    GeometricEvidenceIndex, SceneGraph)
 from prismv.geover.grounding import build_scene_graph, cluster_entities, lift_masks, load_pointmap
 from prismv.geover.hypothesis import (
     Assertion,

@@ -217,11 +217,26 @@ def _print_report(report):
         eff = cell["effect"]
         h = cell["health"]
         flag = "on " if cell["used_geover"] else "off"
+        ctrl = cell.get("controllability", {}) or {}
         print(f"  {cell['task']:<9} {cell['condition']:<10} geover={flag} "
               f"n={a['n_evaluable']:>4}  acc={a['accuracy']:.4f} "
               f"[{a.get('lo', 0):.3f}, {a.get('hi', 0):.3f}]  "
               f"parse={h.get('parse_rate', 0):.2f} exec={h.get('execution_rate', 0):.2f} "
+              f"ctrl={('%.2f' % ctrl['score']) if ctrl.get('score') is not None else '  n/a'} "
               f"fix={eff.get('fixes', 0)} dmg={eff.get('damages', 0)}")
+    def _fmt(v, width=6):
+        return ("%*.3f" % (width, v)) if v is not None else "   n/a"
+
+    tt = report.get("tradeoff_table") or []
+    if tt:
+        print("\n  定位精度 / 推理能力 / 生成可控性 权衡表（主张 4）:")
+        print(f"    {'config':<34} {'reasoning':>9} {'loc@1':>7} {'ctrl':>6} {'geom幻觉':>9}")
+        for row in tt:
+            gh = row.get("geometric_hallucination_rate")
+            print(f"    {row['config']:<34} {row['reasoning_accuracy']:>9.4f} "
+                  f"{row['localization_accuracy']:>7.4f} "
+                  f"{(_fmt(row['controllability'])):>6} "
+                  f"{('%.3f' % gh) if gh is not None else '   n/a':>9}")
     hl = report.get("headline", {})
     if hl:
         print("\n  Headline contrasts (paired bootstrap):")

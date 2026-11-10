@@ -438,6 +438,42 @@ def test_localization_task_scores_end_to_end():
           f"acc@1={m['localization_accuracy_at_1']}")
 
 
+def test_localize_and_describe_arms_report_perception_facts():
+    """可控性指标依赖 code/parse_ok/execution_ok/clue_type，任务驱动必须写回这些字段。
+
+    漏写的症状很隐蔽：程序确实跑了、答案也算对了，但权衡表里 localize 的可控性会是 0.5，
+    读起来像"生成质量差"，实际是上报缺口。
+    """
+    d = write_scene()
+    rec_l = to_task_record({"id": "sp1",
+                            "question": "From the viewpoint presented in image 1, which object "
+                                        "is to the right of the book?",
+                            "images": [], "gt_answer": "A", "gt_entity": "cup",
+                            "options": {"A": "cup", "B": "plant"}}, task="localize")
+    rl = EvalRunner(make_pipeline(StubMLLM(bias="A"), d), records=[rec_l],
+                    conditions=(Condition.SCENE_3D,), verification_states=(True,),
+                    tasks=("localize",), progress_every=0)
+    res_l = rl.run(verbose=False)[0].results[0]
+    assert res_l["parse_ok"] is True, res_l.get("errors")
+    assert res_l["execution_ok"] is True, res_l["code"][:60]
+    assert res_l["clue_type"] == "str", res_l["clue_type"]
+    assert "ground_entities" in res_l["tool_summary"].get("sequence", []), res_l["tool_summary"]
+    cl = metrics.controllability_metrics([res_l])
+    assert cl["applicable"] is True and cl["components"]["program_contract_rate"] == 1.0, cl
+    assert cl["score"] == 1.0, cl
+
+    m = StubMLLM(scripted_text="The cup is to the right of the book.")
+    rec_d = to_task_record({"id": "sp1", "question": QUESTION, "images": []}, task="describe")
+    rd_ = EvalRunner(m and make_pipeline(m, d), records=[rec_d],
+                     conditions=(Condition.SCENE_3D,), verification_states=(True,),
+                     tasks=("describe",), progress_every=0)
+    res_d = rd_.run(verbose=False)[0].results[0]
+    assert res_d["parse_ok"] is True and res_d["execution_ok"] is True, res_d["code"][:60]
+    cd = metrics.controllability_metrics([res_d])
+    assert cd["score"] == 1.0, cd
+    print(f"  localize/describe 可控性均为 {cl['score']}/{cd['score']}（此前会误报 0.5）")
+
+
 def test_localization_target_left_unset_when_unmatchable():
     """An option naming no reconstructed entity must not be coerced into a target."""
     rec = to_task_record({"id": "s9", "question": "which object is to the right of the book?",
@@ -565,6 +601,84 @@ def test_stub_is_reproducible_across_calls():
         outs.append(_qa_result(p, Condition.SCENE_3D, True)["final_answer"])
     assert outs == [GT, GT, GT], outs
     print(f"  three independent runs agree: {outs}")
+
+
+# ----------------------------------------------------------------- controllability
+def test_controllability_full_marks_on_a_clean_run():
+    """Claim 4's third axis, measured: contract, schema, grounding yield, abstention."""
+    d = write_scene()
+    p = make_pipeline(StubMLLM(bias="A"), d)
+    r = p.run(question=QUESTION, options=OPTIONS, images=[], condition=Condition.SCENE_3D,
+              used_geover=True, scene_id="s_ctrl", expected_answer=GT).to_dict()
+    c = metrics.controllability_metrics([r])
+    assert c["applicable"] is True and c["n_scene3d"] == 1, c
+    comp = c["components"]
+    for k in ("program_contract_rate", "output_schema_rate", "grounding_yield_rate",
+              "abstention_compliance_rate"):
+        assert comp[k] == 1.0, (k, comp)
+    assert c["score"] == 1.0, c
+    assert comp["ref_view_specified_rate"] == 1.0, comp
+    # one of four options endorsed, three refuted -> claim-level rate, deliberately not
+    # a per-question hallucination number
+    assert c["geometric_hallucination_rate"] == 0.75, c
+    assert c["override_precision"] == 1.0 and c["n_overrides"] == 1, c
+    print(f"  controllability={c['score']} components={comp}")
+
+
+def test_controllability_is_not_applicable_to_non3d_arms():
+    """The baseline arms have no program and no geometry; a score there would be fiction."""
+    d = write_scene()
+    p = make_pipeline(StubMLLM(bias="A"), d)
+    rows = [p.run(question=QUESTION, options=OPTIONS, images=[], condition=cond,
+                  used_geover=True, scene_id="s_" + cond, expected_answer=GT).to_dict()
+            for cond in (Condition.TEXT_ONLY, Condition.IMAGE_2D)]
+    for cond, r in zip((Condition.TEXT_ONLY, Condition.IMAGE_2D), rows):
+        c = metrics.controllability_metrics([r])
+        assert c["applicable"] is False, (cond, c)
+        assert c["score"] is None, (cond, c["score"])
+        for k in ("program_contract_rate", "output_schema_rate", "grounding_yield_rate"):
+            assert c["components"][k] is None, (cond, k)
+    row = metrics.tradeoff_rows("qa/image_2d/geover=on", rows[:1])
+    assert row["controllability"] is None, row
+    print("  非 3D 臂: applicable=False, score=None（不会被误报成满分）")
+
+
+def test_controllability_punishes_abstention_violation_and_bad_schema():
+    """Two silent failure modes the accuracy number cannot see."""
+    bad = [{"condition": "scene_3d", "used_geover": True, "parse_ok": True,
+            "execution_ok": True, "code": "def program(s):\n    return 1",
+            "clue_type": "int", "provenance": {"n_entities_grounded": 5},
+            "verification": {"applied": False, "option_coverage": {}},
+            "mllm_answer": "A", "final_answer": "C", "correct": True}]
+    c = metrics.controllability_metrics(bad)
+    assert c["components"]["abstention_compliance_rate"] == 0.0, c["components"]
+    assert c["components"]["output_schema_rate"] == 0.0, c["components"]
+    assert c["score"] == 0.5, c["score"]
+    # a program that parses but never defines `program` must fail the contract term
+    noc = [dict(bad[0], code="x = 1", clue_type="str",
+                verification={"applied": True, "option_coverage": {}})]
+    c2 = metrics.controllability_metrics(noc)
+    assert c2["components"]["program_contract_rate"] == 0.0, c2["components"]
+    print(f"  弃权越权 / 返回不可消费类型 / 缺 program 契约 -> 分别被归因，综合分 {c['score']}")
+
+
+def test_tradeoff_table_emits_all_three_axes():
+    d = write_scene()
+    runner = EvalRunner(make_pipeline(StubMLLM(bias="A"), d), records=_records(),
+                        conditions=(Condition.SCENE_3D, Condition.IMAGE_2D),
+                        verification_states=(True,), tasks=("qa",), progress_every=0)
+    runner.run(verbose=False)
+    rep = runner.report()
+    tt = rep["tradeoff_table"]
+    assert len(tt) == 2, tt
+    need = {"reasoning_accuracy", "localization_accuracy", "controllability",
+            "geometric_hallucination_rate", "mean_tool_calls"}
+    assert need <= set(tt[0]), sorted(set(tt[0]))
+    by = {r["config"]: r for r in tt}
+    s3 = by["qa/scene_3d/geover=on"]
+    assert s3["reasoning_accuracy"] == 1.0 and s3["controllability"] == 1.0, s3
+    assert by["qa/image_2d/geover=on"]["controllability"] is None, by
+    print("  权衡表三轴齐备:", {k: tt[0][k] for k in sorted(need)})
 
 
 ALL_TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

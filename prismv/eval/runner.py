@@ -14,7 +14,7 @@ import json
 import os
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 from prismv.eval import metrics
 from prismv.eval.datasets import task_coverage
@@ -45,6 +45,7 @@ class Cell:
             "effect": metrics.verification_effect(self.results),
             "grounding": metrics.grounding_quality(self.results),
             "relations": metrics.relation_level_accuracy(self.results),
+            "controllability": metrics.controllability_metrics(self.results),
         }
 
 
@@ -114,8 +115,21 @@ class EvalRunner:
 
         from prismv.geover.hypothesis import detect_reference_view
 
-        scene = _materialise_scene(self.pipeline, rec)
+        scene, perceive = _materialise_scene(self.pipeline, rec)
         names = [e.name for e in scene.entities.entities] if scene.entities else []
+        if not gt_entity and names:
+            # MindCube ships only a gt option letter, never an entity id. Resolve the correct
+            # option's text against the *grounded* entities: if the answer names something the
+            # reconstruction actually has, the item is localisable; otherwise gt_entity stays
+            # None and the metric skips it rather than inventing a target.
+            text = (rec.get("options") or {}).get(rec.get("gt_answer") or "", "")
+            from prismv.geover.evidence import GeometricEvidenceIndex
+
+            hit = GeometricEvidenceIndex(scene.entities).find(text) if text else None
+            if hit is not None:
+                gt_entity = hit.name
+                out["gt_entity"] = gt_entity
+                out["gt_entity_source"] = "resolved_from_option"
         relation = _relation_from_text(question, names)
         subject = _subject_from_text(question, names)
         ref = detect_reference_view(question)
@@ -134,7 +148,9 @@ class EvalRunner:
         out["anchor"] = subject
         out["reference_view"] = ref
         out["provenance"] = dict(getattr(scene, "entity_provenance", {}))
-        gt_names = {rec.get("gt_entity"), rec.get("gt_answer")}
+        # 可控性指标读这些字段：不写进来，跑过的程序会被记成"零契约"
+        out.update(perceive)
+        gt_names = {gt_entity, rec.get("gt_answer")}
         if gt_names and ranked:
             top = ranked[0].get("candidate")
             out["correct"] = (top in gt_names) if top else None
@@ -158,9 +174,12 @@ class EvalRunner:
         """
         t0 = time.perf_counter()
         question = rec["question"]
-        scene = _materialise_scene(self.pipeline, rec) if Condition.uses_program(condition) else None
+        perceive: Dict[str, Any] = {}
+        scene = None
+        if Condition.uses_program(condition):
+            scene, perceive = _materialise_scene(self.pipeline, rec)
         prompt = _description_prompt(rec)
-        ans = self_pipeline_mllm(self.pipeline, prompt, rec.get("options") or {},
+        ans = _ask_mllm(self.pipeline, prompt, rec.get("options") or {},
                                  images=rec.get("images") if not scene else None,
                                  ground_with_3d=bool(scene))
         out: Dict[str, Any] = {
@@ -172,6 +191,7 @@ class EvalRunner:
         }
         if scene is not None:
             out["provenance"] = dict(getattr(scene, "entity_provenance", {}))
+            out.update(perceive)
             if used_geover:
                 from prismv.geover import GeoVer
 
@@ -236,6 +256,7 @@ class EvalRunner:
             entry["condition_comparison"] = metrics.condition_comparison(cell.results)
             entry["localization"] = metrics.localization_metrics(cell.results)
             entry["description"] = metrics.description_metrics(cell.results)
+            entry["controllability"] = metrics.controllability_metrics(cell.results)
             if include_results:
                 entry["results"] = cell.results
             summary["cells"].append(entry)
@@ -246,8 +267,10 @@ class EvalRunner:
         for cond in self.conditions:
             off, on = qa_cells.get(f"{cond}|False"), qa_cells.get(f"{cond}|True")
             if off and on:
-                a = [1.0 if r.get("correct") else 0.0 for r in on.results if r.get("correct") is not None]
-                b = [1.0 if r.get("correct") else 0.0 for r in off.results if r.get("correct") is not None]
+                a = [1.0 if r.get("correct") else 0.0
+                     for r in on.results if r.get("correct") is not None]
+                b = [1.0 if r.get("correct") else 0.0
+                     for r in off.results if r.get("correct") is not None]
                 headline[f"geover_effect_on_{cond}"] = metrics.paired_diff(a, b)
         for cond, other in (("scene_3d", "image_2d"), ("scene_3d", "text_only")):
             c, o = qa_cells.get(f"{cond}|True"), qa_cells.get(f"{other}|True")
@@ -264,6 +287,9 @@ class EvalRunner:
                     **metrics.paired_diff([ra[s] for s in common], [rb[s] for s in common]),
                 }
         summary["headline"] = headline
+        summary["tradeoff_table"] = [metrics.tradeoff_rows(
+            f"{c['task']}/{c['condition']}/geover={'on' if c['used_geover'] else 'off'}",
+            c.get("results", [])) for c in summary.get("cells", []) if include_results]
         if path:
             os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
             with open(path, "w") as f:
@@ -278,8 +304,7 @@ def _materialise_scene(pipeline: PRISMVPipeline, rec: Dict):
     from prismv.pipeline import ToolRecorder
 
     scene = _make_scene(rec)
-    rec_order = getattr(pipeline, "_scene_cache", None)
-    if rec_order is None:
+    if not hasattr(pipeline, "_scene_cache"):
         pipeline._scene_cache = {}  # type: ignore[attr-defined]
     cache = pipeline._scene_cache  # type: ignore[attr-defined]
     key = rec.get("scene_id")
@@ -287,12 +312,18 @@ def _materialise_scene(pipeline: PRISMVPipeline, rec: Dict):
         return cache[key]
     recorder = ToolRecorder()
     code = pipeline._generate_program(scene)
+    info = {"code": code, "parse_ok": bool(code and code.strip()),
+            "execution_ok": False, "clue_type": "", "tool_summary": {}}
     try:
         from prismv.pipeline import execute_program
 
-        execute_program(code, scene, recorder, 0.0)
+        clue = execute_program(code, scene, recorder, 0.0)
+        info["execution_ok"] = clue is not None
+        info["clue_type"] = type(clue).__name__
     except Exception as e:
+        info["clue_type"] = ""
         scene.entity_provenance = {"grounding_path": "none", "error": str(e)}
+    info["tool_summary"] = recorder.summary()
     if scene.reconstruction is None and scene.images:
         try:
             PRISM_V.reconstruct(scene)
@@ -306,8 +337,8 @@ def _materialise_scene(pipeline: PRISMVPipeline, rec: Dict):
         except Exception as e:
             scene.entity_provenance = {"grounding_path": "none", "error": str(e)}
     if key:
-        cache[key] = scene
-    return scene
+        cache[key] = (scene, info)
+    return scene, info
 
 
 def _make_scene(rec: Dict):
@@ -317,10 +348,14 @@ def _make_scene(rec: Dict):
                  scene_id=rec.get("scene_id"))
 
 
-def self_pipeline_mllm(pipeline: PRISMVPipeline, prompt: str, options: Dict[str, str],
-                       images: Optional[Sequence[str]] = None,
-                       ground_with_3d: bool = False):
-    """Single MLLM call through the injected client (used by describe/localize arms)."""
+def _ask_mllm(pipeline: PRISMVPipeline, prompt: str, options: Dict[str, str],
+              images: Optional[Sequence[str]] = None,
+              ground_with_3d: bool = False):
+    """Single MLLM call through the injected client (used by describe/localize arms).
+
+    Module-level helper, hence no ``self`` prefix: it takes the pipeline explicitly so the
+    task drivers can share one answer path without pretending to be a method.
+    """
     return pipeline.mllm.answer_question(prompt, options, images=images,
                                          ground_with_3d=ground_with_3d)
 

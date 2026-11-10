@@ -16,11 +16,15 @@ import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence
 
-import numpy as np
 
 from prismv.geover.evidence import GeometricEvidenceIndex
 from prismv.geover.hypothesis import Assertion
-from prismv.geover.predicates import MIN_POINTS, PREDICATES, UNKNOWN, Verdict
+from prismv.geover.predicates import MIN_POINTS, PREDICATES, Verdict
+
+
+#: keys carrying measurement overhead rather than geometric judgement. The audit trail must
+#: be a pure function of the scene, so reproducibility checks strip exactly these.
+INSTRUMENT_KEYS = ("cost_us", "predicate_ms")
 
 
 @dataclass
@@ -47,6 +51,12 @@ class Check:
             "margin": round(self.verdict.margin, 4),
             "detail": self.verdict.detail,
             "entities_used": self.entities_used,
+            # Instrumentation, not verdict content. Without a cost figure "lightweight
+            # verification layer" is just an adjective; but timing must never leak into the
+            # reproducibility guarantee, so these keys are listed in INSTRUMENT_KEYS and
+            # stripped by the determinism test rather than being omitted outright.
+            "cost_us": self.cost_us,
+            "predicate_ms": round(self.cost_us / 1000.0, 4),
         }
 
 
@@ -173,5 +183,6 @@ class GeoVerifier:
             letter = a.source.split(":")[-1]
             report.per_option.setdefault(letter, []).append(ch)
         if not report.checks:
-            report.skipped_reason = "no checkable assertion (extraction found no grounded entity pair)"
+            report.skipped_reason = ("no checkable assertion (extraction found no "
+                                     "grounded entity pair)")
         return report

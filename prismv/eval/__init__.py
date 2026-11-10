@@ -12,6 +12,7 @@ from prismv.eval.datasets import (  # noqa: F401
 )
 from prismv.eval.metrics import (  # noqa: F401
     answer_accuracy,
+    controllability_metrics,
     bootstrap_ci,
     condition_comparison,
     description_metrics,
@@ -30,4 +31,4 @@ __all__ = ["datasets", "metrics", "runner", "EvalRunner", "Cell", "load_mindcube
            "scene_type_of", "task_coverage", "answer_accuracy", "verification_effect",
            "relation_level_accuracy", "grounding_quality", "localization_metrics",
            "description_metrics", "pipeline_health", "condition_comparison", "summarize",
-           "bootstrap_ci", "paired_diff"]
+           "bootstrap_ci", "paired_diff", "controllability_metrics", "tradeoff_rows"]

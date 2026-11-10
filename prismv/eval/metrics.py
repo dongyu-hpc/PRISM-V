@@ -15,7 +15,6 @@ be recomputed on a finished run without re-running the model.
 
 from __future__ import annotations
 
-import math
 from collections import Counter, defaultdict
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
@@ -184,7 +183,8 @@ def verification_effect(results: Iterable[Dict]) -> Dict:
         "n_ambiguous": ambiguous,
         "constraint_set_decisive_rate": round(uniquely_endorsed / n_with_coverage, 4)
         if n_with_coverage else 0.0,
-        "applied_case_accuracy": round(float(np.mean(flip_to_correct)), 4) if flip_to_correct else 0.0,
+        "applied_case_accuracy": (round(float(np.mean(flip_to_correct)), 4)
+                                  if flip_to_correct else 0.0),
         "examples": rows[:20],
     }
 
@@ -275,7 +275,8 @@ def description_metrics(results: Iterable[Dict]) -> Dict:
     out = {
         "n_scored": len(prec_per_item),
         "geometric_precision": round(float(np.mean(prec_per_item)), 4) if prec_per_item else 0.0,
-        "contradiction_rate": round(float(np.mean(hallucination_rate)), 4) if hallucination_rate else 0.0,
+        "contradiction_rate": (round(float(np.mean(hallucination_rate)), 4)
+                               if hallucination_rate else 0.0),
         "total_supported_claims": tot_supported,
         "total_contradicted_claims": tot_contradicted,
         "total_undetermined_claims": tot_checkable - tot_supported - tot_contradicted,
@@ -417,6 +418,140 @@ def condition_comparison(results: Iterable[Dict],
     return table
 
 
+# --------------------------------------------------------------------- controllability
+#: the output types a generated program is allowed to hand back. Anything else means the
+#: program ran but produced something the pipeline cannot consume -- a success flag alone
+#: would score it as working.
+ALLOWED_CLUE_TYPES = frozenset({
+    "str", "list", "tuple", "dict", "Image", "NDArray", "numpy.ndarray",
+    "PILImage", "Image.Image", "FrameImage", "RenderCameraImage",
+})
+
+
+def controllability_metrics(results: Iterable[Dict]) -> Dict:
+    """生成可控性：模型写的程序是否守契约、产出是否可校验、证据不足时是否真的住手。
+
+    第 4 条主张要求"在定位精度、推理能力与生成可控性之间做权衡"，而只报准确率的评测里
+    可控性是隐身的：一个把整题退回纯 VLM 兜底、或渲染出一张无法绑定的图的程序，照样能拿
+    到正确答案。这里把它拆成可分别归因的比率，并给出综合分。
+
+    综合分只取"越低越说明框架没在起作用"的四项等权平均，权重写在 ``score_components``
+    里而不是藏进代码：契约率、可校验产出率、几何证据可用率、弃权合规率。
+    """
+    rows = list(results)
+    if not rows:
+        return {"n": 0, "score": None, "applicable": False}
+    n = len(rows)
+    three_d = [r for r in rows if r.get("condition") == "scene_3d"]
+
+    def rate(pred, pool):
+        return round(sum(1 for r in pool if pred(r)) / max(1, len(pool)), 4)
+
+    # 1) 契约：既要能解析出代码块，也要真的定义了 program(input_scene)
+    def contract(r):
+        code = r.get("code") or ""
+        return bool(r.get("parse_ok")) and "def program" in code
+
+    # 2) 输出类型必须在允许集合内：跑通但返回不可消费对象，不算可控
+    def schema_ok(r):
+        ct = r.get("clue_type") or ""
+        return bool(ct) and (ct in ALLOWED_CLUE_TYPES or ct.split(".")[0] in
+                             {c.split(".")[0] for c in ALLOWED_CLUE_TYPES})
+
+    # 3) 几何证据可用：接地到了实体，验证层才有话可说
+    grounded = lambda r: (r.get("provenance") or {}).get("n_entities_grounded", 0)
+
+    # 4) 弃权合规：验证层判定证据不足时，答案必须原样不动
+    def abstained_clean(r):
+        ver = r.get("verification") or {}
+        if not ver or ver.get("applied"):
+            return True
+        pre, post = r.get("mllm_answer"), r.get("final_answer")
+        return (not pre) or (not post) or pre == post
+
+    checks = [c for r in rows for c in (r.get("verification") or {}).get("checks", [])]
+    hard = [c for c in checks if c.get("status") in ("supported", "contradicted")]
+    contradicted = [c for c in hard if c["status"] == "contradicted"]
+    view_rel = [c for c in checks if c.get("relation") in
+                ("left_of", "right_of", "between", "occludes", "same_side",
+                 "closer_than", "farther_than")]
+    with_view = [c for c in view_rel if c.get("ref_view") is not None]
+
+    unverifiable_opts = verified_opts = 0
+    changed_to_correct = changed_total = 0
+    for r in rows:
+        ver = r.get("verification") or {}
+        for letter, cov in (ver.get("option_coverage") or {}).items():
+            tot = sum(cov.values())
+            if tot == 0:
+                unverifiable_opts += 1
+            else:
+                verified_opts += 1
+        if ver.get("changed_answer"):
+            changed_total += 1
+            if r.get("correct"):
+                changed_to_correct += 1
+
+    comp = {
+        "program_contract_rate": rate(contract, three_d) if three_d else None,
+        "execution_rate": rate(lambda r: r.get("execution_ok"), three_d) if three_d else None,
+        "output_schema_rate": rate(schema_ok, three_d) if three_d else None,
+        "grounding_yield_rate": rate(lambda r: grounded(r) > 0, three_d) if three_d else None,
+        "abstention_compliance_rate": rate(abstained_clean, rows),
+        "ref_view_specified_rate": round(len(with_view) / len(view_rel), 4) if view_rel else None,
+    }
+    score_items = [v for v in (comp["program_contract_rate"], comp["output_schema_rate"],
+                              comp["grounding_yield_rate"],
+                              comp["abstention_compliance_rate"]) if v is not None]
+    # A non-3D arm has no program, no clue and no geometry, so only the abstention term can
+    # even be computed. Reporting the mean of what happens to be available would hand the
+    # text/image baselines a flattering 1.0 for a dimension that does not apply to them; the
+    # trade-off table would then read as "the baseline is perfectly controllable". Score is
+    # None in that case and the caller prints n/a.
+    applicable = bool(three_d)
+    return {
+        "n": n,
+        "n_scene3d": len(three_d),
+        "applicable": applicable,
+        "components": comp,
+        "score": (round(sum(score_items) / len(score_items), 4)
+                  if (applicable and score_items) else None),
+        "score_components": ["program_contract_rate", "output_schema_rate",
+                             "grounding_yield_rate", "abstention_compliance_rate"],
+        # 几何幻觉的可测代理，**断言级**而非题级：在所有能被判定的空间断言里，
+        # 被重建证据推翻的占比。四选项题里三个选项为假是常态，因此这个数天然偏
+        # 高，只能横向比较（开/关验证、不同重建质量），不能读作"多少比例的场景在幻觉"。
+        "geometric_hallucination_rate": round(len(contradicted) / len(hard), 4) if hard else None,
+        "checked_claim_rate": round(verified_opts / max(1, verified_opts + unverifiable_opts), 4),
+        "unverifiable_option_share": round(
+            unverifiable_opts / max(1, verified_opts + unverifiable_opts), 4),
+        "override_precision": (round(changed_to_correct / changed_total, 4)
+                               if changed_total else None),
+        "n_overrides": changed_total,
+        "mean_checks_per_question": round(len(checks) / n, 2),
+    }
+
+
+def tradeoff_rows(label: str, results: Iterable[Dict]) -> Dict:
+    """One row of the 定位精度 / 推理能力 / 生成可控性 trade-off table (claim 4)."""
+    rs = list(results)
+    loc = localization_metrics(rs)
+    ctrl = controllability_metrics(rs)
+    acc = answer_accuracy(rs)
+    return {
+        "config": label,
+        "n": len(rs),
+        "reasoning_accuracy": acc["accuracy"],
+        "localization_accuracy": loc["localization_accuracy_at_1"],
+        "localization_acc_at_3": loc["localization_accuracy_at_3"],
+        "controllability": ctrl["score"],
+        "geometric_hallucination_rate": ctrl["geometric_hallucination_rate"],
+        "median_position_error": loc.get("median_position_error_extent_units"),
+        "mean_tool_calls": pipeline_health(rs).get("mean_tool_calls", 0),
+        "evaluable": acc["n_evaluable"],
+    }
+
+
 def summarize(results: Iterable[Dict]) -> Dict:
     """One call that produces the full result table for a run."""
     rs = list(results)
@@ -431,4 +566,5 @@ def summarize(results: Iterable[Dict]) -> Dict:
         "grounding_quality": grounding_quality(rs),
         "localization": localization_metrics(rs),
         "description": description_metrics(rs),
+        "controllability": controllability_metrics(rs),
     }

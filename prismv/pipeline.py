@@ -1,8 +1,9 @@
 """The PRISM-V perceive -> verify -> reason pipeline.
 
 The inherited loop was: write a program, run it, hand whatever it rendered to a VLM, take the
-answer. Where the inherited loop stops -- perceive, render, ask -- PRISM-V inserts a constraint check
-between "the model believes something" and "that belief becomes the answer", and makes the
+answer. Where the inherited loop stops -- perceive, render, ask -- PRISM-V inserts a
+constraint check between "the model believes something" and "that belief becomes the answer",
+and makes the
 input condition an explicit variable so the framework's contribution can be attributed rather
 than asserted.
 
@@ -25,8 +26,6 @@ import numpy as np
 
 from prismv.interface import PRISM_V, Reconstruction, Scene
 from prismv.geover import GeoVer
-from prismv.geover.evidence import GeometricEvidenceIndex, SceneGraph
-from prismv.geover.hypothesis import assertions_from_text
 
 # ------------------------------------------------------------------ input conditions
 class Condition:
@@ -409,6 +408,7 @@ class PipelineResult:
     provenance: Dict = field(default_factory=dict)
     errors: List[str] = field(default_factory=list)
     timings: Dict[str, float] = field(default_factory=dict)
+    degraded_views: Optional[int] = None
 
     def to_dict(self) -> Dict:
         return {
@@ -421,6 +421,7 @@ class PipelineResult:
             "reasoning": self.reasoning, "tool_summary": self.tool_summary,
             "verification": self.verification, "provenance": self.provenance,
             "errors": self.errors, "timings": {k: round(v, 3) for k, v in self.timings.items()},
+            "degraded_views": self.degraded_views,
         }
 
 
@@ -431,7 +432,7 @@ class PRISMVPipeline:
                  processed_dir: Optional[str] = None, entity_masks: Optional[Sequence[Dict]] = None,
                  verification_weight: float = 1.0, min_support: int = 1,
                  conf_thres: float = 0.0, exec_timeout: float = 180.0,
-                 fallback_clusters: int = 0):
+                 fallback_clusters: int = 0, max_views: Optional[int] = None):
         self.mllm = mllm
         self.code_generator = code_generator
         self.entity_masks = entity_masks
@@ -440,6 +441,10 @@ class PRISMVPipeline:
         self.conf_thres = conf_thres
         self.exec_timeout = exec_timeout
         self.fallback_clusters = fallback_clusters
+        # View-count cap: the reconstruction-quality sweep degrades geometry by feeding fewer
+        # views. Without this knob the "n_views" arm silently feeds every image and measures
+        # nothing, while the table still prints a neat curve.
+        self.max_views = int(max_views) if max_views else None
         PRISM_V.PROCESSED_BASE_DIR = processed_dir
 
     # ---------------------------------------------------------------- code writing
@@ -463,11 +468,21 @@ class PRISMVPipeline:
             images: Optional[Sequence[str]] = None, condition: str = Condition.SCENE_3D,
             used_geover: bool = True, scene_id: Optional[str] = None,
             expected_answer: Optional[str] = None,
-            entity_masks: Optional[Sequence[Dict]] = None) -> PipelineResult:
+            entity_masks: Optional[Sequence[Dict]] = None,
+            max_views: Optional[int] = None) -> PipelineResult:
         res = PipelineResult(scene_id=scene_id, question=question, options=options,
                              condition=condition, used_geover=used_geover,
                              expected_answer=expected_answer)
-        scene = Scene(list(images or []), question, scene_id=scene_id)
+        views = max_views if max_views is not None else self.max_views
+        imgs = list(images or [])
+        if views and len(imgs) > views:
+            # keep a spread across the sequence rather than the first N, so the scene still
+            # covers distinct viewpoints -- truncating to the leading frames turns "fewer
+            # views" into "one corner of the room" and understates the effect
+            idx = np.linspace(0, len(imgs) - 1, views).round().astype(int)
+            imgs = [imgs[i] for i in sorted(set(int(x) for x in idx))]
+            res.degraded_views = len(imgs)
+        scene = Scene(imgs, question, scene_id=scene_id)
         recorder = ToolRecorder()
 
         # ---------------- perceive ----------------
