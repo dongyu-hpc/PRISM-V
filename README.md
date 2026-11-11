@@ -18,18 +18,6 @@ entities                    assertions                  the candidates before co
  prismv.geover.grounding)
 ```
 
-## What PRISM-V adds over the baseline
-
-| | baseline pipeline | PRISM-V |
-| --- | --- | --- |
-| Tool output | rendered novel views (an image the VLM interprets) | images **plus** entity-level 3D geometry the program can query |
-| Geometric checks | none — the render *is* the evidence | `GeoVer`: 12 predicates, retrieval, constraint checking, reranking |
-| Entity geometry | unavailable — `points.ply` loses `(view,row,col)`, `tool/segment` absent | per-view `pointmaps.npz`, mask→3D lifting, plus an injection path for pre-computed 3D points |
-| Verticality | not addressed | gravity axis estimated from camera poses (VGGT's world frame has no up) |
-| Reference frames | implicit | explicit and required for lateral predicates; missing viewer ⇒ `undetermined` |
-| Evaluation | accuracy on MindCube | 3 tasks × 3 input conditions × verification on/off, paired bootstrap, net-effect decomposition |
-| Analysis | — | tool-strategy, reconstruction-quality and reranker sweeps |
-
 ## Installation
 
 ```shell
